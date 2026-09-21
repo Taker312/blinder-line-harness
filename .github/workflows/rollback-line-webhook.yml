@@ -7,10 +7,15 @@ on:
         description: Type ROLLBACK to restore the previously saved webhook
         required: true
         type: string
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/rollback-line-webhook.trigger'
 
 jobs:
   rollback:
-    if: inputs.confirmation == 'ROLLBACK'
+    if: github.event_name == 'push' || inputs.confirmation == 'ROLLBACK'
     runs-on: ubuntu-latest
     env:
       LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
