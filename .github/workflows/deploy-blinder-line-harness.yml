@@ -1,0 +1,170 @@
+name: Deploy Blinder LINE Harness
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/deploy-blinder-line-harness.yml'
+
+concurrency:
+  group: deploy-blinder-line-harness
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      D1_DATABASE_NAME: ${{ secrets.D1_DATABASE_NAME }}
+      D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+      WORKER_NAME: blinder-line-harness
+      R2_BUCKET_NAME: line-harness-images
+      PAGES_PROJECT_NAME: blinder-line-harness-admin
+      ADMIN_URL: https://blinder-line-harness-admin.pages.dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          test -n "$D1_DATABASE_NAME"
+          test -n "$D1_DATABASE_ID"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared packages
+        run: pnpm --filter @line-crm/shared --filter @line-crm/line-sdk --filter @line-crm/db --filter @line-harness/update-engine build
+
+      - name: Initialize D1 database safely
+        run: |
+          set -euo pipefail
+          table_count="$(npx wrangler d1 execute "$D1_DATABASE_NAME" --remote --json \
+            --command "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='friends'" \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s);process.stdout.write(String(j[0]?.results?.[0]?.count ?? 0))})')"
+
+          if [ "$table_count" = "0" ]; then
+            echo "Empty D1 detected; applying the official bootstrap schema."
+            npx wrangler d1 execute "$D1_DATABASE_NAME" --remote --file=packages/db/bootstrap.sql
+          else
+            echo "Existing D1 detected; preserving its data."
+          fi
+
+          npx wrangler d1 execute "$D1_DATABASE_NAME" --remote \
+            --command "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('friends','line_accounts','admin_users') ORDER BY name"
+
+      - name: Resolve Workers URL
+        id: urls
+        run: |
+          set -euo pipefail
+          response="$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain")"
+          subdomain="$(printf '%s' "$response" | jq -r '.result.subdomain // empty')"
+          test -n "$subdomain"
+          worker_url="https://${WORKER_NAME}.${subdomain}.workers.dev"
+          echo "worker_url=$worker_url" >> "$GITHUB_OUTPUT"
+          echo "Worker URL resolved."
+
+      - name: Build Worker and LIFF assets
+        run: pnpm --filter worker build
+        env:
+          VITE_LIFF_ID: ${{ secrets.VITE_LIFF_ID }}
+          VITE_BOT_BASIC_ID: ${{ secrets.VITE_BOT_BASIC_ID }}
+          VITE_CALENDAR_CONNECTION_ID: ${{ secrets.VITE_CALENDAR_CONNECTION_ID }}
+
+      - name: Patch Worker configuration
+        env:
+          WORKER_URL: ${{ steps.urls.outputs.worker_url }}
+        run: |
+          set -euo pipefail
+          config="apps/worker/dist/line_harness/wrangler.json"
+          test -f "$config"
+          tmp="$(mktemp)"
+          jq \
+            --arg account "$CLOUDFLARE_ACCOUNT_ID" \
+            --arg db_name "$D1_DATABASE_NAME" \
+            --arg db_id "$D1_DATABASE_ID" \
+            --arg bucket "$R2_BUCKET_NAME" \
+            --arg worker_url "$WORKER_URL" \
+            --arg admin_url "$ADMIN_URL" \
+            --arg pages "$PAGES_PROJECT_NAME" '
+              .account_id = $account
+              | (.d1_databases[] | select(.binding == "DB") | .database_name) = $db_name
+              | (.d1_databases[] | select(.binding == "DB") | .database_id) = $db_id
+              | (.r2_buckets[] | select(.binding == "IMAGES") | .bucket_name) = $bucket
+              | .vars.WORKER_NAME = env.WORKER_NAME
+              | .vars.WORKER_URL = $worker_url
+              | .vars.WORKER_PUBLIC_URL = $worker_url
+              | .vars.ADMIN_ORIGIN = $admin_url
+              | .vars.ADMIN_PUBLIC_URL = $admin_url
+              | .vars.ADMIN_ALLOW_CROSS_SITE = "true"
+              | .vars.ADMIN_PAGES_PROJECT = $pages
+            ' "$config" > "$tmp"
+          mv "$tmp" "$config"
+
+      - name: Deploy Cloudflare Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: apps/worker
+          command: deploy --config dist/line_harness/wrangler.json --name blinder-line-harness
+
+      - name: Apply optional LINE secrets
+        env:
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
+          LINE_LOGIN_CHANNEL_ID: ${{ secrets.LINE_LOGIN_CHANNEL_ID }}
+          LIFF_URL: ${{ secrets.LIFF_URL }}
+          API_KEY: ${{ secrets.API_KEY }}
+        run: |
+          set -euo pipefail
+          for name in LINE_CHANNEL_ACCESS_TOKEN LINE_CHANNEL_SECRET LINE_LOGIN_CHANNEL_ID LIFF_URL API_KEY; do
+            value="${!name:-}"
+            if [ -n "$value" ]; then
+              printf '%s' "$value" | npx wrangler secret put "$name" --name "$WORKER_NAME"
+            else
+              echo "$name is not registered yet; skipping."
+            fi
+          done
+
+      - name: Build Admin Panel
+        run: pnpm --filter web build
+        env:
+          NEXT_PUBLIC_API_URL: ${{ steps.urls.outputs.worker_url }}
+          APP_BUILD_TIME: ${{ github.run_id }}
+
+      - name: Deploy Admin Panel
+        run: |
+          set -euo pipefail
+          npx wrangler pages deploy apps/web/out \
+            --project-name="$PAGES_PROJECT_NAME" \
+            --branch=main \
+            --commit-message="deploy ${GITHUB_SHA}"
+
+      - name: Verify public endpoints
+        env:
+          WORKER_URL: ${{ steps.urls.outputs.worker_url }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --retry 5 --retry-delay 3 "$WORKER_URL/health" >/dev/null
+          curl --fail --silent --show-error --retry 5 --retry-delay 3 "$ADMIN_URL" >/dev/null
+          echo "WORKER_URL=$WORKER_URL"
+          echo "ADMIN_URL=$ADMIN_URL"
