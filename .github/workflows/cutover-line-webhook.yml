@@ -1,0 +1,70 @@
+name: Cut Over LINE Webhook
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type SWITCH to replace the current production webhook
+        required: true
+        type: string
+
+jobs:
+  cutover:
+    if: inputs.confirmation == 'SWITCH'
+    runs-on: ubuntu-latest
+    env:
+      LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+      NEW_WEBHOOK_URL: https://blinder-line-harness.blinder-taker312.workers.dev/webhook
+
+    steps:
+      - name: Cut over with automatic rollback
+        run: |
+          set -euo pipefail
+          test -n "$LINE_CHANNEL_ACCESS_TOKEN"
+
+          auth_header="Authorization: Bearer $LINE_CHANNEL_ACCESS_TOKEN"
+          current="$(curl --fail --silent --show-error \
+            --header "$auth_header" \
+            https://api.line.me/v2/bot/channel/webhook/endpoint)"
+          old_endpoint="$(printf '%s' "$current" | jq -r '.endpoint // empty')"
+          test -n "$old_endpoint"
+
+          direct_test="$(curl --fail --silent --show-error \
+            --header "$auth_header" \
+            --header 'Content-Type: application/json' \
+            --data "$(jq -n --arg endpoint "$NEW_WEBHOOK_URL" '{endpoint: $endpoint}')" \
+            https://api.line.me/v2/bot/channel/webhook/test)"
+          printf '%s' "$direct_test" | jq -e '.success == true' >/dev/null
+
+          curl --fail --silent --show-error \
+            --request PUT \
+            --header "$auth_header" \
+            --header 'Content-Type: application/json' \
+            --data "$(jq -n --arg endpoint "$NEW_WEBHOOK_URL" '{endpoint: $endpoint}')" \
+            https://api.line.me/v2/bot/channel/webhook/endpoint >/dev/null
+
+          switched=false
+          for attempt in $(seq 1 12); do
+            configured="$(curl --fail --silent --show-error \
+              --header "$auth_header" \
+              https://api.line.me/v2/bot/channel/webhook/endpoint \
+              | jq -r '.endpoint // empty')"
+            if [ "$configured" = "$NEW_WEBHOOK_URL" ]; then
+              switched=true
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "$switched" != "true" ]; then
+            curl --fail --silent --show-error \
+              --request PUT \
+              --header "$auth_header" \
+              --header 'Content-Type: application/json' \
+              --data "$(jq -n --arg endpoint "$old_endpoint" '{endpoint: $endpoint}')" \
+              https://api.line.me/v2/bot/channel/webhook/endpoint >/dev/null
+            echo "Cutover verification failed; the previous webhook was restored."
+            exit 1
+          fi
+
+          echo "LINE webhook cutover completed and verified."
