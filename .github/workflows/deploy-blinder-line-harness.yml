@@ -186,7 +186,8 @@ jobs:
           WORKER_URL: ${{ steps.urls.outputs.worker_url }}
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error --retry 5 --retry-delay 3 "$WORKER_URL/health" >/dev/null
-          curl --fail --silent --show-error --retry 5 --retry-delay 3 "$ADMIN_URL" >/dev/null
+          sleep 30
+          curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 6 "$WORKER_URL/health" >/dev/null
+          curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 6 "$ADMIN_URL" >/dev/null
           echo "WORKER_URL=$WORKER_URL"
           echo "ADMIN_URL=$ADMIN_URL"
