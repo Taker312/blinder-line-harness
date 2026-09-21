@@ -149,8 +149,9 @@ jobs:
           workingDirectory: apps/worker
           command: deploy --config dist/line_harness/wrangler.json --name blinder-line-harness
 
-      - name: Apply optional LINE secrets
+      - name: Apply LINE and admin secrets
         env:
+          LINE_CHANNEL_ID: ${{ secrets.LINE_CHANNEL_ID }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
           LINE_LOGIN_CHANNEL_ID: ${{ secrets.LINE_LOGIN_CHANNEL_ID }}
@@ -166,6 +167,38 @@ jobs:
               echo "$name is not registered yet; skipping."
             fi
           done
+
+          if [ -n "${LINE_CHANNEL_ID:-}" ] && [ -n "${LINE_CHANNEL_ACCESS_TOKEN:-}" ] && [ -n "${LINE_CHANNEL_SECRET:-}" ]; then
+            sql_file="$(mktemp)"
+            SQL_FILE="$sql_file" node <<'NODE'
+          const { randomUUID } = require('node:crypto');
+          const fs = require('node:fs');
+          const q = (value) => "'" + String(value).replaceAll("'", "''") + "'";
+          const id = randomUUID();
+          const channelId = process.env.LINE_CHANNEL_ID;
+          const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+          const secret = process.env.LINE_CHANNEL_SECRET;
+          const sql = `
+          INSERT INTO line_accounts (
+            id, channel_id, name, channel_access_token, channel_secret, is_active
+          ) VALUES (
+            ${q(id)}, ${q(channelId)}, 'インフラキャリア', ${q(token)}, ${q(secret)}, 1
+          )
+          ON CONFLICT(channel_id) DO UPDATE SET
+            name = excluded.name,
+            channel_access_token = excluded.channel_access_token,
+            channel_secret = excluded.channel_secret,
+            is_active = 1,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours');
+          `;
+          fs.writeFileSync(process.env.SQL_FILE, sql, { mode: 0o600 });
+          NODE
+            npx wrangler d1 execute "$D1_DATABASE_NAME" --remote --file="$sql_file"
+            rm -f "$sql_file"
+            echo "LINE account registered without deleting previous accounts."
+          else
+            echo "LINE account registration skipped because one or more credentials are missing."
+          fi
 
       - name: Build Admin Panel
         run: pnpm --filter web build
