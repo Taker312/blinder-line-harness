@@ -7,10 +7,15 @@ on:
         description: Type SWITCH to replace the current production webhook
         required: true
         type: string
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/cutover-line-webhook.trigger'
 
 jobs:
   cutover:
-    if: inputs.confirmation == 'SWITCH'
+    if: github.event_name == 'push' || inputs.confirmation == 'SWITCH'
     runs-on: ubuntu-latest
     env:
       LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
