@@ -52,3 +52,32 @@ jobs:
 
           echo "D1_DATABASE_NAME=blinder-line-harness"
           echo "D1_DATABASE_ID=$database_id"
+
+      - name: Find or create image bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+          buckets="$(npx --yes wrangler@4.77.0 r2 bucket list)"
+          if ! printf '%s\n' "$buckets" | grep -Fq "line-harness-images"; then
+            npx --yes wrangler@4.77.0 r2 bucket create line-harness-images --location apac
+          fi
+          echo "R2_BUCKET_NAME=line-harness-images"
+
+      - name: Find or create admin Pages project
+        shell: bash
+        run: |
+          set -euo pipefail
+          projects="$(npx --yes wrangler@4.77.0 pages project list --json)"
+          exists="$(printf '%s' "$projects" | node -e '
+            let input = "";
+            process.stdin.on("data", chunk => input += chunk);
+            process.stdin.on("end", () => {
+              const projects = JSON.parse(input);
+              const exists = projects.some(item => item.name === "blinder-line-harness-admin");
+              process.stdout.write(exists ? "yes" : "no");
+            });
+          ')"
+          if [ "$exists" != "yes" ]; then
+            npx --yes wrangler@4.77.0 pages project create blinder-line-harness-admin --production-branch main
+          fi
+          echo "PAGES_PROJECT_NAME=blinder-line-harness-admin"
